@@ -6233,6 +6233,98 @@ function tone() {
                 f"{source}: expected distinct suspend and handoff holes, got {holes}")
         evidence["lifecycle"][source] = {"dropouts": entry["audio_dropouts"], "holes_s": holes}
 
+    # A third take checks browser A/V sync on simultaneous flash + beep pulses:
+    # strict one-frame alignment on hardware, hosted hold/drop accounting under --hosted.
+    av_page = e.root / "av_pulse.html"
+    av_page.write_text("""<body style='margin:0;background:#000;overflow:hidden'>
+<canvas id='c' width='320' height='180' style='width:100vw;height:100vh;display:block'></canvas>
+<script>
+(async () => {
+  const ctx = new AudioContext({sampleRate: 48000});
+  await ctx.resume();
+  const osc = ctx.createOscillator();
+  osc.frequency.value = 1000;
+  const gain = ctx.createGain();
+  gain.gain.value = 0;
+  osc.connect(gain);
+  gain.connect(ctx.destination);
+  osc.start();
+  const t0 = Math.ceil(ctx.currentTime + 0.5);
+  for (let k = 1; k <= 15; k++) {
+    gain.gain.setValueAtTime(0.5, t0 + k);
+    gain.gain.setValueAtTime(0.0, t0 + k + 0.08);
+  }
+  const g = document.getElementById('c').getContext('2d');
+  let seq = 0;
+  function frame() {
+    seq = (seq + 1) & 0xffff || 1;
+    const rel = ctx.currentTime - t0;
+    const on = rel >= 1.0 && (rel - Math.floor(rel)) < 0.1;
+    for (let b = 0; b < 16; b++) {
+      g.fillStyle = ((seq >> (15 - b)) & 1) ? '#fff' : '#000';
+      g.fillRect(b * 20, 0, 20, 45);
+    }
+    g.fillStyle = '#fff';
+    g.fillRect(0, 45, 320, 45);
+    g.fillStyle = on ? '#fff' : '#000';
+    g.fillRect(0, 90, 320, 90);
+    requestAnimationFrame(frame);
+  }
+  requestAnimationFrame(frame);
+})();
+</script></body>""")
+    cfg["sources"] = [{"id": "web", "kind": "browser", "file": str(av_page), "width": 320,
+                       "height": 180, "fps": 30, "control_audio": True}]
+    e.apply(cfg)
+    e.rpc("engine", {"running": True}, timeout=60 if WINDOWS else 30)
+
+    def av_ready():
+        try:
+            png = base64.b64decode(e.rpc("snapshot", {"source": "web"})["png_base64"])
+        except RpcError:
+            return False
+        probe_png = e.root / "av_ready.png"
+        probe_png.write_bytes(png)
+        px = ffmpeg("-i", probe_png, "-vf", "crop=iw:ih/4:0:ih/4,scale=1:1:flags=area",
+                    "-pix_fmt", "gray", "-f", "rawvideo", "-").stdout
+        return bool(px) and px[0] > 128
+
+    until(av_ready, 60 if WINDOWS else 30, "browser A/V pulse page painting", interval=0.2)
+    av_started = e.rpc("start", {"seconds": 8}, timeout=60 if WINDOWS else 30)
+    av_path = Path(av_started["manifest"])
+    av_manifest = until(lambda: finished(av_started["manifest"]), 45, "browser A/V pulse finalization")
+    until(lambda: e.rpc("status")["state"] == "idle", description="idle recorder")
+    hosted_av = bool(loss_limit(evidence))
+    evidence["av_sync"] = {}
+    for source in ("web", "program"):
+        file, entry = manifest_file(av_path, av_manifest, source)
+        require(entry["audio_dropouts"] == 0, f"{source}: browser A/V pulse take had audio dropouts")
+        lost = None
+        if hosted_av:
+            frames_info = json.loads(command([
+                "ffprobe", "-v", "error", "-select_streams", "v:0",
+                "-show_frames", "-show_entries", "frame=best_effort_timestamp_time",
+                "-of", "json", file
+            ], timeout=90).stdout)["frames"]
+            times = [float(f["best_effort_timestamp_time"]) for f in frames_info]
+            bars = ffmpeg(
+                "-i", file, "-map", "0:v:0", "-an",
+                "-vf", "crop=iw:ih/4:0:0,scale=16:1:flags=area",
+                "-fps_mode", "passthrough", "-pix_fmt", "gray", "-f", "rawvideo", "-", timeout=90
+            ).stdout
+            lost = set()
+            prev_seq = None
+            for idx, t in enumerate(times):
+                row = bars[idx * 16:(idx + 1) * 16]
+                seq = sum((1 << (15 - b)) for b in range(16) if row[b] > 128) if len(row) == 16 else 0
+                if seq == 0 or seq == prev_seq:
+                    lost.add(round(t * 30))
+                prev_seq = seq
+        else:
+            require(entry["dropped_frames"] == 0,
+                    f"{source}: strict browser A/V pulse take dropped {entry['dropped_frames']} frame(s)")
+        evidence["av_sync"][source] = sync_check(file, 30, lost=lost)
+
 
 def scenario_linux_browser(e, cfg, evidence):
     """A browser source on Linux (the isocast-browser helper next to the

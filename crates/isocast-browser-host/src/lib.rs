@@ -676,7 +676,17 @@ impl<P: FramePool> Source<P> {
             match header {
                 // A beat: the page is loading or still, without new pictures.
                 protocol::Header::Ready => shared.alive(),
-                protocol::Header::Frame { width, height } => {
+                header @ (protocol::Header::Frame { .. } | protocol::Header::TimedFrame { .. }) => {
+                    let (width, height, age_us) = match header {
+                        protocol::Header::Frame { width, height } => (width, height, 0),
+                        protocol::Header::TimedFrame {
+                            width,
+                            height,
+                            age_us,
+                        } => (width, height, age_us),
+                        _ => unreachable!(),
+                    };
+                    let arrived = shared.os.now();
                     let len = width as usize * height as usize * 4;
                     if (width, height) != (spec.width, spec.height) {
                         return Err(helper(anyhow!(
@@ -711,7 +721,9 @@ impl<P: FramePool> Source<P> {
                     match frame {
                         Some(frame) => {
                             shared.alive();
-                            (self.sink.frame)(frame, shared.os.now());
+                            let captured =
+                                arrived - Duration::from_micros(u64::from(age_us).min(500_000));
+                            (self.sink.frame)(frame, captured);
                         }
                         None => {
                             // Every pooled frame is still downstream: skip it.
