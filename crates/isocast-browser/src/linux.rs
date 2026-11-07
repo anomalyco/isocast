@@ -162,7 +162,7 @@ impl Out {
                         // isocastd is gone.
                         std::process::exit(0);
                     }
-                    if record.starts_with(b"FRAM") {
+                    if record.starts_with(b"FRAM") || record.starts_with(b"FRMT") {
                         let _ = give_back.try_send(record);
                     } else if record.starts_with(b"FAIL") {
                         let _ = wrote_fail.try_send(());
@@ -647,6 +647,7 @@ fn run(args: Args, out: Out) -> i32 {
         fps: args.fps,
         tick: Cell::new(0),
         busy: Cell::new(false),
+        missed: Cell::new(false),
         cleared: Cell::new(false),
         frame: RefCell::new(Vec::new()),
         warned: Cell::new(false),
@@ -746,6 +747,7 @@ struct Pacer {
     fps: u32,
     tick: Cell<u64>,
     busy: Cell<bool>,
+    missed: Cell<bool>,
     /// An empty picture has been sent since the page was unloaded.
     cleared: Cell<bool>,
     /// The picture being sent's bytes (reused).
@@ -785,9 +787,9 @@ fn schedule(
 fn tick(
     pacer: &Rc<Pacer>,
     view: &webkit6::WebView,
-    loaded: &Cell<bool>,
+    loaded: &Rc<Cell<bool>>,
     out: &Rc<Out>,
-    exit: &Exit,
+    exit: &Rc<Exit>,
     w: u32,
     h: u32,
 ) {
@@ -818,9 +820,18 @@ fn tick(
         return;
     }
     if pacer.busy.replace(true) {
+        pacer.missed.set(true);
         return;
     }
-    let (pacer, out) = (pacer.clone(), out.clone());
+    let captured = Instant::now();
+    let half_interval_us = 500_000 / u64::from(pacer.fps.max(60));
+    let (pacer, view_done, loaded, out, exit) = (
+        pacer.clone(),
+        view.clone(),
+        loaded.clone(),
+        out.clone(),
+        exit.clone(),
+    );
     view.snapshot(
         webkit6::SnapshotRegion::Visible,
         webkit6::SnapshotOptions::TRANSPARENT_BACKGROUND,
@@ -830,7 +841,15 @@ fn tick(
             match result {
                 Ok(texture) => {
                     let mut scratch = pacer.frame.borrow_mut();
-                    let record = picture(&texture, w, h, out.buffer(), &mut scratch);
+                    let record = picture(
+                        &texture,
+                        w,
+                        h,
+                        captured,
+                        half_interval_us,
+                        out.buffer(),
+                        &mut scratch,
+                    );
                     // A full queue drops the picture: isocastd is behind.
                     out.send(record);
                 }
@@ -839,6 +858,9 @@ fn tick(
                         eprintln!("snapshot failed: {err}");
                     }
                 }
+            }
+            if pacer.missed.replace(false) {
+                tick(&pacer, &view_done, &loaded, &out, &exit, w, h);
             }
         },
     );
@@ -854,14 +876,15 @@ fn clear_once(cleared: &Cell<bool>, send: impl FnOnce() -> bool) {
     }
 }
 
-/// A `FRAM` record of `texture`, straight-alpha BGRA at exactly w × h (a
+/// A `FRMT` record of `texture`, straight-alpha BGRA at exactly w × h (a
 /// smaller or larger snapshot is cropped or padded with transparency), in
-/// `record` (a reused buffer). The snapshot normally is w × h: then it is
-/// downloaded straight into the record, the only copy of its pixels.
+/// `record` (a reused buffer), carrying how long the snapshot + readback took.
 fn picture(
     texture: &gdk::Texture,
     w: u32,
     h: u32,
+    captured: Instant,
+    half_interval_us: u64,
     mut record: Vec<u8>,
     scratch: &mut Vec<u8>,
 ) -> Vec<u8> {
@@ -871,12 +894,13 @@ fn picture(
     );
     let len = (w * h * 4) as usize;
     record.clear();
-    record.extend_from_slice(b"FRAM");
-    record.extend_from_slice(&(8 + len as u32).to_le_bytes());
+    record.extend_from_slice(b"FRMT");
+    record.extend_from_slice(&(12 + len as u32).to_le_bytes());
     record.extend_from_slice(&w.to_le_bytes());
     record.extend_from_slice(&h.to_le_bytes());
-    record.resize(16 + len, 0);
-    let pixels = &mut record[16..];
+    record.extend_from_slice(&0u32.to_le_bytes());
+    record.resize(20 + len, 0);
+    let pixels = &mut record[20..];
     // Cairo's ARGB32: premultiplied, BGRA in memory on little-endian.
     if (tw, th) == (w, h) {
         texture.download(pixels, w as usize * 4);
@@ -891,6 +915,9 @@ fn picture(
         }
     }
     unpremultiply(pixels);
+    let elapsed_us = u64::try_from(captured.elapsed().as_micros()).unwrap_or(u64::MAX);
+    let age_us = half_interval_us.saturating_add(elapsed_us).min(500_000) as u32;
+    record[16..20].copy_from_slice(&age_us.to_le_bytes());
     record
 }
 

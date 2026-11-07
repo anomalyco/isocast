@@ -194,6 +194,22 @@ fn protocol_reads_each_record_and_rejects_bad_ones() {
     timed[12] = 2;
     assert!(protocol::read_header(&mut &timed[..]).is_err());
 
+    let mut tframe = b"FRMT".to_vec();
+    tframe.extend(&20u32.to_le_bytes());
+    tframe.extend(&2u32.to_le_bytes());
+    tframe.extend(&1u32.to_le_bytes());
+    tframe.extend(&14_500u32.to_le_bytes());
+    tframe.extend([0u8; 8]);
+    let mut tframe_slice = &tframe[..];
+    assert_eq!(
+        protocol::read_header(&mut tframe_slice).unwrap(),
+        Some(protocol::Header::TimedFrame {
+            width: 2,
+            height: 1,
+            age_us: 14_500,
+        })
+    );
+
     // A picture whose size doesn't match its length, an oversized record,
     // and an unknown tag are errors, not guesses.
     let mut bad = b"FRAM".to_vec();

@@ -77,6 +77,7 @@ struct Page {
     loaded: Rc<Cell<bool>>,
     /// An empty frame has been sent since the page was unloaded.
     cleared: Rc<Cell<bool>>,
+    closed: Rc<Cell<bool>>,
 }
 
 impl Page {
@@ -120,6 +121,7 @@ impl Page {
 
 impl Drop for Page {
     fn drop(&mut self) {
+        self.closed.set(true);
         self.timer.invalidate();
         // The handler holds the audio sink; let it go with the page.
         unsafe {
@@ -315,66 +317,36 @@ fn open_page(
     // Snapshot at the frame rate once the page has loaded, skipping a tick
     // while a snapshot is in flight. An unloaded page leaves one empty
     // frame.
-    let pool = Rc::new(RefCell::new(pool));
-    let busy = Rc::new(Cell::new(false));
-    let reported = Rc::new(Cell::new(false));
     let loaded = Rc::new(Cell::new(true));
     let cleared = Rc::new(Cell::new(false));
+    let closed = Rc::new(Cell::new(false));
+    let poll_fps = fps.max(60);
+    let snapshotter = Rc::new(Snapshotter {
+        web: web.clone(),
+        window: window.clone(),
+        width,
+        height,
+        loaded: loaded.clone(),
+        cleared: cleared.clone(),
+        closed: closed.clone(),
+        busy: Cell::new(false),
+        missed: Cell::new(false),
+        reported: Cell::new(false),
+        pool: RefCell::new(pool),
+        sink,
+    });
     let tick = RcBlock::new({
-        let (web, window) = (web.clone(), window.clone());
-        let (loaded, cleared) = (loaded.clone(), cleared.clone());
+        let snapshotter = snapshotter.clone();
         move |_timer: NonNull<NSTimer>| {
-            if busy.get() {
-                return;
-            }
-            if !loaded.get() {
-                if !cleared.replace(true) {
-                    let empty = pool.borrow_mut().draw(&mut |pixels, _| pixels.fill(0));
-                    if let Ok(Some(frame)) = empty {
-                        (sink.frame)(frame, host_time());
-                    }
-                }
-                return;
-            }
-            if unsafe { web.isLoading() } {
-                return;
-            }
-            busy.set(true);
-            let config = unsafe { WKSnapshotConfiguration::new(mtm) };
-            // One snapshot pixel per frame pixel, whatever the window's
-            // backing scale (2 on Retina screens, which costs four times
-            // as much to draw and then to scale down).
-            let points = f64::from(width) / window.backingScaleFactor();
-            unsafe { config.setSnapshotWidth(Some(&NSNumber::new_f64(points))) };
-            let (busy, pool, sink) = (busy.clone(), pool.clone(), sink.clone());
-            let reported = reported.clone();
-            let done = RcBlock::new(move |image: *mut NSImage, error: *mut NSError| {
-                busy.set(false);
-                let drawn = match unsafe { image.as_ref() } {
-                    Some(image) => draw(&mut pool.borrow_mut(), image, width, height),
-                    None => Err(match unsafe { error.as_ref() } {
-                        Some(error) => anyhow!("{}", error.localizedDescription()),
-                        None => anyhow!("no picture"),
-                    }),
-                };
-                match drawn {
-                    Ok(Some(frame)) => (sink.frame)(frame, host_time()),
-                    // The pool is out of frames: the consumer is behind.
-                    Ok(None) => {}
-                    Err(err) => {
-                        if !reported.replace(true) {
-                            isocast_diagnostics::diagnostic!("warn";
-                                "isocastd: browser source snapshot failed: {err:#}"
-                            );
-                        }
-                    }
-                }
-            });
-            unsafe { web.takeSnapshotWithConfiguration_completionHandler(Some(&config), &done) };
+            snapshotter.tick(mtm);
         }
     });
     let timer = unsafe {
-        NSTimer::scheduledTimerWithTimeInterval_repeats_block(1.0 / f64::from(fps), true, &tick)
+        NSTimer::scheduledTimerWithTimeInterval_repeats_block(
+            1.0 / f64::from(poll_fps),
+            true,
+            &tick,
+        )
     };
     let page = Page {
         window,
@@ -383,9 +355,97 @@ fn open_page(
         address,
         loaded,
         cleared,
+        closed,
     };
     page.load();
     Ok(page)
+}
+
+struct Snapshotter {
+    web: Retained<WKWebView>,
+    window: Retained<NSWindow>,
+    width: u32,
+    height: u32,
+    loaded: Rc<Cell<bool>>,
+    cleared: Rc<Cell<bool>>,
+    closed: Rc<Cell<bool>>,
+    busy: Cell<bool>,
+    missed: Cell<bool>,
+    reported: Cell<bool>,
+    pool: RefCell<FramePool>,
+    sink: Arc<VideoSink<PixelBuffer>>,
+}
+
+impl Snapshotter {
+    fn tick(self: &Rc<Self>, mtm: MainThreadMarker) {
+        if self.closed.get() {
+            return;
+        }
+        if self.busy.get() {
+            self.missed.set(true);
+            return;
+        }
+        if !self.loaded.get() {
+            if !self.cleared.replace(true) {
+                let empty = self.pool.borrow_mut().draw(&mut |pixels, _| pixels.fill(0));
+                if let Ok(Some(frame)) = empty {
+                    (self.sink.frame)(frame, host_time());
+                }
+            }
+            return;
+        }
+        if unsafe { self.web.isLoading() } {
+            return;
+        }
+        self.busy.set(true);
+        let config = unsafe { WKSnapshotConfiguration::new(mtm) };
+        // One snapshot pixel per frame pixel, whatever the window's
+        // backing scale (2 on Retina screens, which costs four times
+        // as much to draw and then to scale down).
+        let points = f64::from(self.width) / self.window.backingScaleFactor();
+        unsafe { config.setSnapshotWidth(Some(&NSNumber::new_f64(points))) };
+        let captured = host_time();
+        let state = self.clone();
+        let done = RcBlock::new(move |image: *mut NSImage, error: *mut NSError| {
+            state.busy.set(false);
+            if state.closed.get() {
+                return;
+            }
+            let drawn = match unsafe { image.as_ref() } {
+                Some(image) => draw(
+                    &mut state.pool.borrow_mut(),
+                    image,
+                    state.width,
+                    state.height,
+                ),
+                None => Err(match unsafe { error.as_ref() } {
+                    Some(error) => anyhow!("{}", error.localizedDescription()),
+                    None => anyhow!("no picture"),
+                }),
+            };
+            match drawn {
+                Ok(Some(frame)) => (state.sink.frame)(frame, captured),
+                // The pool is out of frames: the consumer is behind.
+                Ok(None) => {}
+                Err(err) => {
+                    if !state.reported.replace(true) {
+                        isocast_diagnostics::diagnostic!("warn";
+                            "isocastd: browser source snapshot failed: {err:#}"
+                        );
+                    }
+                }
+            }
+            if state.missed.replace(false)
+                && let Some(mtm) = MainThreadMarker::new()
+            {
+                state.tick(mtm);
+            }
+        });
+        unsafe {
+            self.web
+                .takeSnapshotWithConfiguration_completionHandler(Some(&config), &done)
+        };
+    }
 }
 
 /// Draw a snapshot into a frame from `pool`, scaled to `width`×`height`,
@@ -739,6 +799,8 @@ class FakeAudioContext {
   constructor() {
     this.state = 'running';
     this.sampleRate = 48000;
+    this.baseLatency = 0.01;
+    this.outputLatency = 0.04;
     this.destination = new AudioDestinationNode(this);
     this._listeners = [];
     this.audioWorklet = {
@@ -801,11 +863,20 @@ ObjC.import('Foundation');
   ctx.resume();
   workletInstance.process([[q, q]]);
   step(9);
-  // Also exercise late 'pause' arriving 1 quantum after the >=30 ms gap
-  // before the resumed chunk flushes: still tags that resumed chunk '+'.
+  // Also exercise late 'pause' (posted at suspend before the 75 ms pause,
+  // delivered to the worklet 1 quantum after the >=30 ms gap): still tags '+'.
+  const pauseSentMs = clockMs;
   clockMs += 75;
   workletInstance.process([[q, q]]);
+  workletInstance.port.onmessage({ data: { type: 'pause', at: pauseSentMs } });
+  step(8);
+  // Exercise an involuntary >=30 ms render hiccup 1 quantum BEFORE suspend(),
+  // followed by a 75 ms suspend: pauseArmed must stay armed for the real suspend.
+  clockMs += 35;
+  workletInstance.process([[q, q]]);
+  clockMs += 3;
   ctx.suspend();
+  clockMs += 75;
   ctx.resume();
   step(8);
   const data = $(JSON.stringify(sent) + '\n').dataUsingEncoding($.NSUTF8StringEncoding);
@@ -839,8 +910,14 @@ ObjC.import('Foundation');
                 | BrowserAudioTiming::Resumed { end_us } => end_us,
                 BrowserAudioTiming::Arrival => panic!("expected timed chunk: {text}"),
             };
-            // Deliver in two ~130 ms late IPC bursts (within MAX_LAG = 195 ms).
-            let arrival_us = if i <= 4 { 1_000_160_000 } else { 1_000_260_000 };
+            // Deliver in three ~130 ms late IPC bursts (within MAX_LAG = 195 ms).
+            let arrival_us = if i <= 4 {
+                1_000_160_000
+            } else if i <= 6 {
+                1_000_260_000
+            } else {
+                1_000_420_000
+            };
             let now = isocast_engine::Time::from_nanos(arrival_us as i64 * 1_000);
             let (at, gap) = stamper.stamp_timed(frames, timing, Some(arrival_us), now);
             assert_eq!(gap, None, "unexpected dropout on {timing:?}");
@@ -851,23 +928,29 @@ ObjC.import('Foundation');
                 end_us,
             ));
         }
-        // Chunks 0..4 are pre-suspend (1024, 256, 1024, 128 frames): all Continuous.
-        // Chunk 4 is post-resume #1 (1024 frames, Resumed), chunk 5 is its 256-frame
-        // Continuous tail, and chunk 6 is post-resume #2 (late 'pause', 1024 frames, Resumed).
+        // Chunks 0..4 are pre-suspend (1024, 256, 1024, 128 frames): all Continuous,
+        // with chunk 0's end_us shifted +50 ms (baseLatency 10 ms + outputLatency 40 ms).
+        // Chunk 4 is post-resume #1 (Resumed), chunk 5 is its 256-frame tail, chunk 6
+        // is post-resume #2 (late 'pause', Resumed), chunks 7..9 are the 128-frame tail
+        // flushed at the 35 ms hiccup and the 128-frame hiccup quantum flushed on suspend
+        // (both Continuous), and chunk 9 is post-resume #3 (Resumed).
+        assert_eq!(decoded_runs[0].3, 1_000_074_000);
         let flags: Vec<bool> = decoded_runs.iter().map(|r| r.0).collect();
         assert_eq!(
             flags,
-            [false, false, false, false, true, false, true],
+            [
+                false, false, false, false, true, false, true, false, false, true
+            ],
             "{decoded_runs:?}"
         );
-        for (pre, post) in [(3, 4), (5, 6)] {
+        for (pre, post, expected) in [(3, 4, 70..=80), (5, 6, 70..=80), (8, 9, 105..=120)] {
             let pre_end = decoded_runs[pre]
                 .2
                 .add_ticks(decoded_runs[pre].1 as u64, SAMPLE_RATE);
             let hole_ms = decoded_runs[post].2.saturating_since(pre_end).as_millis();
             assert!(
-                (70..=80).contains(&hole_ms),
-                "expected ~75 ms suspend hole at {pre}->{post}, got {hole_ms} ms ({decoded_runs:?})"
+                expected.contains(&hole_ms),
+                "expected {expected:?} ms hole at {pre}->{post}, got {hole_ms} ms ({decoded_runs:?})"
             );
         }
     }

@@ -67,22 +67,23 @@
         super();
         this.active = true;
         this.pauseArmed = false;
-        this.sawGap = false;
+        this.gapEndMs = undefined;
         this.lastMs = undefined;
         this.write = chunker(sampleRate, (buffer, endUs, resumed) => {
-          this.sawGap = false;
+          this.gapEndMs = undefined;
           this.port.postMessage({ buffer, endUs, resumed }, [buffer]);
         });
         this.port.onmessage = ({ data }) => {
-          if (data === 'pause') {
-            if (this.sawGap) {
+          if (data?.type === 'pause') {
+            if (this.gapEndMs !== undefined && this.gapEndMs > data.at) {
               this.write.resumeNext();
-              this.sawGap = false;
+              this.gapEndMs = undefined;
             } else {
               this.write.flush(this.lastMs ?? Date.now());
+              this.gapEndMs = undefined;
               this.pauseArmed = true;
             }
-          } else if (data === 'stop') {
+          } else if (data?.type === 'stop') {
             this.write.flush(this.lastMs ?? Date.now());
             this.active = false;
           }
@@ -96,8 +97,9 @@
           if (this.pauseArmed) {
             this.write.resumeNext();
             this.pauseArmed = false;
+            this.gapEndMs = undefined;
           } else {
-            this.sawGap = true;
+            this.gapEndMs = now;
           }
         }
         this.write(inputs[0][0], inputs[0][1], inputs[0][0]?.length || 128, now);
@@ -143,6 +145,11 @@
   function guarded(action) {
     try { return action(); } catch (error) { warn(error); }
   }
+  function outputLatencyUs(context) {
+    const seconds = (Number(context.baseLatency) || 0) + (Number(context.outputLatency) || 0);
+    return seconds > 0 && Number.isFinite(seconds) ? Math.min(120000, Math.round(seconds * 1e6)) : 0;
+  }
+
   async function listen(route, mix) {
     const context = route.context;
     let node, pauseNode, stopNode;
@@ -153,7 +160,7 @@
       const resumed = hadAudio && (tapResumed || workletResumed);
       hadAudio = true;
       tapResumed = false;
-      post(buffer, endUs, resumed);
+      post(buffer, endUs + outputLatencyUs(context), resumed);
     }
     try {
       await (route.module ??= context.audioWorklet.addModule(moduleURL));
@@ -163,8 +170,8 @@
       route.pausing = false;
       node = new AudioWorkletNode(context, 'isocast-audio', { channelCount: 2, channelCountMode: 'explicit' });
       node.port.onmessage = ({ data }) => deliver(data.buffer, data.endUs, data.resumed);
-      pauseNode = () => node.port.postMessage('pause');
-      stopNode = () => node.port.postMessage('stop');
+      pauseNode = () => node.port.postMessage({ type: 'pause', at: Date.now() });
+      stopNode = () => node.port.postMessage({ type: 'stop' });
       console.info('Isocast page audio: AudioWorklet');
     } catch (error) {
       if (mix !== output) return;
@@ -172,9 +179,12 @@
       activeTap = token;
       tapResumed = hadAudio;
       route.pausing = false;
-      let pauseArmed = false, lastMs;
+      let pauseArmed = false, gapEndMs, lastMs;
       node = context.createScriptProcessor(CHUNK_FRAMES, 2, 2);
-      const write = chunker(context.sampleRate, deliver);
+      const write = chunker(context.sampleRate, (buffer, endUs, resumed) => {
+        gapEndMs = undefined;
+        deliver(buffer, endUs, resumed);
+      });
       node.onaudioprocess = ({ inputBuffer }) => {
         if (token !== activeTap) return;
         const now = Date.now();
@@ -183,12 +193,25 @@
           if (pauseArmed) {
             write.resumeNext();
             pauseArmed = false;
+            gapEndMs = undefined;
+          } else {
+            gapEndMs = now;
           }
         }
         write(inputBuffer.getChannelData(0), inputBuffer.getChannelData(1), inputBuffer.length, now);
         lastMs = now;
       };
-      pauseNode = () => { write.flush(lastMs ?? Date.now()); pauseArmed = true; };
+      pauseNode = () => {
+        const at = Date.now();
+        if (gapEndMs !== undefined && gapEndMs > at) {
+          write.resumeNext();
+          gapEndMs = undefined;
+        } else {
+          write.flush(lastMs ?? at);
+          gapEndMs = undefined;
+          pauseArmed = true;
+        }
+      };
       stopNode = () => write.flush(lastMs ?? Date.now());
     }
     const mute = context.createGain();
